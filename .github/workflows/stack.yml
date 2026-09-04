@@ -26,11 +26,13 @@ jobs:
 
       - name: Install dependencies
         run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq ffmpeg
           pip install numpy Pillow scipy astroalign rawpy
 
       - name: Create directories
         run: |
-          mkdir -p input output
+          mkdir -p input frames output
 
       - name: Download input files
         run: |
@@ -47,10 +49,15 @@ jobs:
                   if part.startswith('http'):
                       urls.append(part)
 
+          video_exts = ('mp4','mov','avi','mkv','webm','ts','ser','fits')
+          photo_exts = ('jpg','jpeg','png','tiff','tif','dng','raw','cr2','nef','arw','bmp')
+
           print(f'Downloading {len(urls)} files...')
           for i, url in enumerate(urls):
-              ext = url.split('?')[0].split('.')[-1].lower()
-              if ext in ('jpg','jpeg','png','tiff','tif','dng','raw','cr2','nef','arw','bmp'):
+              ext = url.split('?')[0].split('.')[-1].lower().split('/')[-1]
+              if ext in photo_exts:
+                  outname = f'file_{i:03d}.{ext}'
+              elif ext in video_exts:
                   outname = f'file_{i:03d}.{ext}'
               else:
                   outname = f'file_{i:03d}.bin'
@@ -63,9 +70,39 @@ jobs:
               print(f'  {f} ({size/1024:.0f} KB)')
           "
 
+      - name: Extract video frames
+        run: |
+          echo "Extracting frames from video files..."
+          for f in input/*.mp4 input/*.mov input/*.avi input/*.mkv input/*.webm input/*.ts; do
+            [ -f "$f" ] || continue
+            base=$(basename "$f" | sed 's/\.[^.]*$//')
+            echo "  Extracting frames from $f..."
+            ffmpeg -i "$f" -vsync 0 "frames/${base}_%03d.png" -y -loglevel warning
+          done
+          echo "Frames extracted:"
+          ls frames/*.png 2>/dev/null | wc -l
+          echo "total frame files"
+
+      - name: Copy photos to frames
+        run: |
+          for f in input/*.jpg input/*.jpeg input/*.png input/*.tiff input/*.tif input/*.dng input/*.raw input/*.cr2 input/*.nef input/*.arw input/*.bmp; do
+            [ -f "$f" ] || continue
+            base=$(basename "$f")
+            ext="${base##*.}"
+            name="${base%.*}"
+            if [[ "$ext" == "dng" || "$ext" == "raw" || "$ext" == "cr2" || "$ext" == "nef" || "$ext" == "arw" ]]; then
+              echo "  Converting $f to PNG..."
+              ffmpeg -i "$f" -y "frames/${name}.png" -loglevel warning
+            else
+              cp "$f" "frames/"
+            fi
+          done
+          echo "All frames:"
+          ls frames/ | head -40
+
       - name: Stack images
         run: |
-          python3 stack.py input output
+          python3 stack.py frames output
 
       - name: Upload stacked results
         uses: actions/upload-artifact@v4
@@ -78,7 +115,13 @@ jobs:
         run: |
           echo "## Stacking Complete" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
-          echo "### Output files:" >> $GITHUB_STEP_SUMMARY
+          echo "### Input:" >> $GITHUB_STEP_SUMMARY
+          ls -lh input/ >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Frames extracted:" >> $GITHUB_STEP_SUMMARY
+          ls frames/*.png 2>/dev/null | wc -l >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Output:" >> $GITHUB_STEP_SUMMARY
           ls -lh output/ >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
-          echo "Download from the **Artifacts** section of this workflow run." >> $GITHUB_STEP_SUMMARY
+          echo "Download from the **Artifacts** section." >> $GITHUB_STEP_SUMMARY
