@@ -1,0 +1,84 @@
+name: Stack Astrophotography
+
+on:
+  workflow_dispatch:
+    inputs:
+      file_urls:
+        description: 'URLs to your astro files (one per line, or comma-separated)'
+        required: true
+        type: string
+      file_urls_2:
+        description: 'More URLs (optional, second batch)'
+        required: false
+        type: string
+
+jobs:
+  stack:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          pip install numpy Pillow scipy astroalign rawpy
+
+      - name: Create directories
+        run: |
+          mkdir -p input output
+
+      - name: Download input files
+        run: |
+          python3 -c "
+          import subprocess, os, sys
+
+          urls_raw = '''${{ inputs.file_urls }}
+          ${{ inputs.file_urls_2 }}'''
+
+          urls = []
+          for line in urls_raw.strip().split('\n'):
+              for part in line.split(','):
+                  part = part.strip()
+                  if part.startswith('http'):
+                      urls.append(part)
+
+          print(f'Downloading {len(urls)} files...')
+          for i, url in enumerate(urls):
+              ext = url.split('?')[0].split('.')[-1].lower()
+              if ext in ('jpg','jpeg','png','tiff','tif','dng','raw','cr2','nef','arw','bmp'):
+                  outname = f'file_{i:03d}.{ext}'
+              else:
+                  outname = f'file_{i:03d}.bin'
+              print(f'  {url} -> input/{outname}')
+              subprocess.run(['wget', '-q', '-O', f'input/{outname}', url], check=True)
+          
+          print('Downloaded files:')
+          for f in sorted(os.listdir('input')):
+              size = os.path.getsize(f'input/{f}')
+              print(f'  {f} ({size/1024:.0f} KB)')
+          "
+
+      - name: Stack images
+        run: |
+          python3 stack.py input output
+
+      - name: Upload stacked results
+        uses: actions/upload-artifact@v4
+        with:
+          name: stacked-astro-${{ github.run_number }}
+          path: output/
+          retention-days: 30
+
+      - name: Summary
+        run: |
+          echo "## Stacking Complete" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Output files:" >> $GITHUB_STEP_SUMMARY
+          ls -lh output/ >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "Download from the **Artifacts** section of this workflow run." >> $GITHUB_STEP_SUMMARY
