@@ -123,6 +123,7 @@ def main():
         try:
             # Use first image as reference (keep its original size/orientation)
             ref = images[0]
+            ref_shape = ref.shape[:2]
             registered = [ref]
 
             for i in range(1, len(images)):
@@ -132,11 +133,31 @@ def main():
                         images[i], ref, detection_sigma=5, max_control_points=50
                     )
                     aligned = aa.apply_transform(transform, images[i], ref)
+                    # Ensure aligned frame matches reference dimensions
+                    if aligned.shape[:2] != ref_shape:
+                        from PIL import Image as PILImage
+                        pil = PILImage.fromarray(np.clip(aligned, 0, 255).astype(np.uint8))
+                        pil = pil.resize((ref_shape[1], ref_shape[0]), PILImage.LANCZOS)
+                        aligned = np.array(pil, dtype=np.float64)
                     registered.append(aligned)
                     print(f"  Frame {i}: aligned (triangles matched)")
                 except Exception as e:
                     print(f"  Frame {i}: alignment failed ({e}), using unaligned")
                     registered.append(images[i])
+
+            # Ensure every registered frame matches reference shape
+            print(f"\nNormalizing all frames to reference shape {ref_shape}...")
+            final = []
+            for i, im in enumerate(registered):
+                if im.shape[:2] != ref_shape:
+                    from PIL import Image as PILImage
+                    pil = PILImage.fromarray(np.clip(im, 0, 255).astype(np.uint8))
+                    pil = pil.resize((ref_shape[1], ref_shape[0]), PILImage.LANCZOS)
+                    final.append(np.array(pil, dtype=np.float64))
+                    print(f"  Resized frame {i}: {im.shape[:2]} -> {ref_shape}")
+                else:
+                    final.append(im)
+            registered = final
 
             print(f"\nSigma-clipping stack ({len(registered)} frames, sigma=2.0)...")
             stacked = sigma_clip_stack(registered, sigma=2.0)
