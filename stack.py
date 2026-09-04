@@ -117,34 +117,19 @@ def main():
         print("Need at least 2 images to stack!")
         sys.exit(1)
 
-    # Ensure all same size
-    h = min(im.shape[0] for im in images)
-    w = min(im.shape[1] for im in images)
-    resized = []
-    for im in images:
-        if im.shape[0] != h or im.shape[1] != w:
-            from PIL import Image as PILImage
-            pil = PILImage.fromarray(np.clip(im, 0, 255).astype(np.uint8))
-            pil = pil.resize((w, h), PILImage.LANCZOS)
-            resized.append(np.array(pil, dtype=np.float64))
-        else:
-            resized.append(im)
-    images = resized
-
     # Star alignment + stacking
     if HAS_ASTROALIGN:
         print(f"\nUsing astroalign for star detection and registration...")
         try:
-            # Use first image as reference
+            # Use first image as reference (keep its original size/orientation)
             ref = images[0]
             registered = [ref]
 
             for i in range(1, len(images)):
                 try:
-                    # Detect and align
+                    # astroalign handles rotation, scale and translation between frames
                     transform, (source_cat, target_cat) = aa.find_transform(
-                        aa.utils.erasebad(images[i]),
-                        aa.utils.erasebad(ref)
+                        images[i], ref, detection_sigma=5, max_control_points=50
                     )
                     aligned = aa.apply_transform(transform, images[i], ref)
                     registered.append(aligned)
