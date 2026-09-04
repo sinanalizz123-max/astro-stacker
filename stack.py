@@ -80,6 +80,25 @@ def sigma_clip_stack(images, sigma=2.0):
     return np.sum(stack * mask, axis=0) / np.maximum(np.sum(mask, axis=0), 1)
 
 
+def estimate_background(img, margin_frac=0.15):
+    """Estimate additive sky background using dark border pixels (mode via median)."""
+    h, w = img.shape[:2]
+    m = int(min(h, w) * margin_frac)
+    border = np.concatenate([
+        img[:m, :].reshape(-1, 3),
+        img[-m:, :].reshape(-1, 3),
+        img[:, :m].reshape(-1, 3),
+        img[:, -m:].reshape(-1, 3),
+    ])
+    return np.median(border, axis=0)
+
+
+def background_subtract(img):
+    """Subtract estimated additive sky background, shift so background ~0."""
+    bg = estimate_background(img)
+    return np.clip(img - bg, 0, 255)
+
+
 def main():
     input_dir = sys.argv[1] if len(sys.argv) > 1 else "input"
     output_dir = sys.argv[2] if len(sys.argv) > 2 else "output"
@@ -116,6 +135,14 @@ def main():
     if len(images) < 2:
         print("Need at least 2 images to stack!")
         sys.exit(1)
+
+    # Background subtract each frame first (removes fog/lifted black from
+    # compressed video frames so the stack has a dark sky, not a bright haze)
+    print("\nBackground subtraction (removing sky fog)...")
+    for i, im in enumerate(images):
+        bg = estimate_background(im)
+        images[i] = background_subtract(im)
+        print(f"  Frame {i}: bg={np.round(bg.astype(int)).tolist()}")
 
     # Star alignment + stacking
     if HAS_ASTROALIGN:

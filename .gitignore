@@ -1,2 +1,6 @@
 stacked_output/
 stacked_results.zip
+output_new/
+output_new.zip
+__pycache__/
+*.pyc
