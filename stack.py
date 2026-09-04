@@ -136,38 +136,25 @@ def main():
         print("Need at least 2 images to stack!")
         sys.exit(1)
 
-    # Background subtract each frame first (removes fog/lifted black from
-    # compressed video frames so the stack has a dark sky, not a bright haze)
-    print("\nBackground subtraction (removing sky fog)...")
-    for i, im in enumerate(images):
-        bg = estimate_background(im)
-        images[i] = background_subtract(im)
-        print(f"  Frame {i}: bg={np.round(bg.astype(int)).tolist()}")
-
-    # Star alignment + stacking
+    # Step 1: Star alignment (needs full star signals, do BEFORE background subtraction)
     if HAS_ASTROALIGN:
-        print(f"\nUsing astroalign for star detection and registration...")
+        print(f"\nStep 1: Star alignment with astroalign...")
         try:
-            # Use first image as reference (keep its original size/orientation)
             ref = images[0]
             ref_shape = ref.shape[:2]
             registered = [ref]
 
             for i in range(1, len(images)):
                 try:
-                    # astroalign handles rotation, scale and translation between frames
-                    transform, (source_cat, target_cat) = aa.find_transform(
-                        images[i], ref, detection_sigma=5, max_control_points=50
-                    )
-                    aligned = aa.apply_transform(transform, images[i], ref)
-                    # Ensure aligned frame matches reference dimensions
+                    # astroalign.register(source, target) returns (aligned_image, footprint)
+                    aligned, footprint = aa.register(images[i], ref)
                     if aligned.shape[:2] != ref_shape:
                         from PIL import Image as PILImage
                         pil = PILImage.fromarray(np.clip(aligned, 0, 255).astype(np.uint8))
                         pil = pil.resize((ref_shape[1], ref_shape[0]), PILImage.LANCZOS)
                         aligned = np.array(pil, dtype=np.float64)
                     registered.append(aligned)
-                    print(f"  Frame {i}: aligned (triangles matched)")
+                    print(f"  Frame {i}: aligned")
                 except Exception as e:
                     print(f"  Frame {i}: alignment failed ({e}), using unaligned")
                     registered.append(images[i])
@@ -185,16 +172,23 @@ def main():
                 else:
                     final.append(im)
             registered = final
-
-            print(f"\nSigma-clipping stack ({len(registered)} frames, sigma=2.0)...")
-            stacked = sigma_clip_stack(registered, sigma=2.0)
         except Exception as e:
             print(f"\nAstroalign failed: {e}")
             print("Falling back to simple averaging...")
-            stacked = sigma_clip_stack(images, sigma=2.0)
+            registered = images
     else:
-        print("\nastroalign not available, using simple average stack...")
-        stacked = manual_align_and_stack(images)
+        registered = images
+
+    # Step 2: Background subtraction on ALIGNED frames (removes video compression fog)
+    print(f"\nStep 2: Background subtraction (removing sky fog)...")
+    for i, im in enumerate(registered):
+        bg = estimate_background(im)
+        registered[i] = background_subtract(im)
+        print(f"  Frame {i}: bg_subtracted (bg was {np.round(bg.astype(int)).tolist()})")
+
+    # Step 3: Sigma-clip stack
+    print(f"\nStep 3: Sigma-clipping stack ({len(registered)} frames, sigma=2.0)...")
+    stacked = sigma_clip_stack(registered, sigma=2.0)
 
     # Save raw stacked result
     print("\nSaving results...")
