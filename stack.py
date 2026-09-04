@@ -1,9 +1,12 @@
 #!/usr/bin/env python3
 """
 Astrophotography Stacker
-- Star detection and alignment using astroalign
-- Sigma-clipping stack for noise rejection
-- Histogram stretch for visibility
+Pipeline:
+  1. Load all frames and normalize to a common resolution
+  2. Star-align each frame to the reference using astroalign
+  3. Background-subtract each aligned frame (removes sky fog/black-lift)
+  4. Sigma-clipping stack for noise rejection
+  5. Save raw, stretched, and enhanced versions
 """
 
 import os
@@ -18,26 +21,8 @@ try:
 except ImportError:
     HAS_ASTROALIGN = False
 
-try:
-    import rawpy
-    HAS_RAWPY = True
-except ImportError:
-    HAS_RAWPY = False
-
 
 def load_image(path):
-    ext = os.path.splitext(path)[1].lower()
-    if ext in ('.dng', '.raw', '.cr2', '.nef', '.arw', '.orf'):
-        if not HAS_RAWPY:
-            print(f"  rawpy not installed, converting {path} via ffmpeg")
-            import subprocess
-            out = path + ".tiff"
-            subprocess.run(["ffmpeg", "-i", path, "-y", out], check=True,
-                           capture_output=True)
-            return np.array(Image.open(out).convert("RGB"), dtype=np.float64)
-        with rawpy.imread(path) as raw:
-            rgb = raw.postprocess(use_camera_wb=True, output_bps=16)
-            return rgb.astype(np.float64) / 65535.0 * 255.0
     return np.array(Image.open(path).convert("RGB"), dtype=np.float64)
 
 
@@ -45,6 +30,42 @@ def save_image(arr, path):
     arr = np.clip(arr, 0, 255).astype(np.uint8)
     Image.fromarray(arr).save(path, optimize=True)
     print(f"  Saved: {path} ({os.path.getsize(path) / 1024:.0f} KB)")
+
+
+def resize_keep_aspect(img, target_hw):
+    """Resize image to target height,width (stretch exactly to fit)."""
+    if img.shape[:2] == target_hw:
+        return img
+    pil = Image.fromarray(np.clip(img, 0, 255).astype(np.uint8))
+    pil = pil.resize((target_hw[1], target_hw[0]), Image.LANCZOS)
+    return np.array(pil, dtype=np.float64)
+
+
+def sigma_clip_stack(images, sigma=2.0):
+    stack = np.stack(images, axis=0)
+    mean = np.mean(stack, axis=0)
+    std = np.std(stack, axis=0)
+    mask = np.abs(stack - mean) < sigma * np.maximum(std, 1.0)
+    return np.sum(stack * mask, axis=0) / np.maximum(np.sum(mask, axis=0), 1)
+
+
+def estimate_background(img, margin_frac=0.15):
+    """Estimate additive sky background using dark border pixels."""
+    h, w = img.shape[:2]
+    m = int(min(h, w) * margin_frac)
+    border = np.concatenate([
+        img[:m, :].reshape(-1, 3),
+        img[-m:, :].reshape(-1, 3),
+        img[:, :m].reshape(-1, 3),
+        img[:, -m:].reshape(-1, 3),
+    ])
+    return np.median(border, axis=0)
+
+
+def background_subtract(img):
+    """Subtract estimated additive sky background so sky ~0."""
+    bg = estimate_background(img)
+    return np.clip(img - bg, 0, 255)
 
 
 def histogram_stretch(img, low_pct=0.5, high_pct=99.5):
@@ -61,52 +82,12 @@ def histogram_stretch(img, low_pct=0.5, high_pct=99.5):
     return result
 
 
-def manual_align_and_stack(images):
-    """Fallback: simple center-crop + average stack (no star alignment)."""
-    h = min(im.shape[0] for im in images)
-    w = min(im.shape[1] for im in images)
-    cropped = []
-    for im in images:
-        cy, cx = im.shape[0] // 2, im.shape[1] // 2
-        cropped.append(im[cy - h // 2:cy - h // 2 + h, cx - w // 2:cx - w // 2 + w])
-    return np.mean(cropped, axis=0)
-
-
-def sigma_clip_stack(images, sigma=2.0):
-    stack = np.stack(images, axis=0)
-    mean = np.mean(stack, axis=0)
-    std = np.std(stack, axis=0)
-    mask = np.abs(stack - mean) < sigma * np.maximum(std, 1.0)
-    return np.sum(stack * mask, axis=0) / np.maximum(np.sum(mask, axis=0), 1)
-
-
-def estimate_background(img, margin_frac=0.15):
-    """Estimate additive sky background using dark border pixels (mode via median)."""
-    h, w = img.shape[:2]
-    m = int(min(h, w) * margin_frac)
-    border = np.concatenate([
-        img[:m, :].reshape(-1, 3),
-        img[-m:, :].reshape(-1, 3),
-        img[:, :m].reshape(-1, 3),
-        img[:, -m:].reshape(-1, 3),
-    ])
-    return np.median(border, axis=0)
-
-
-def background_subtract(img):
-    """Subtract estimated additive sky background, shift so background ~0."""
-    bg = estimate_background(img)
-    return np.clip(img - bg, 0, 255)
-
-
 def main():
-    input_dir = sys.argv[1] if len(sys.argv) > 1 else "input"
+    input_dir = sys.argv[1] if len(sys.argv) > 1 else "frames"
     output_dir = sys.argv[2] if len(sys.argv) > 2 else "output"
     os.makedirs(output_dir, exist_ok=True)
 
-    # Find all image files
-    exts = ["*.png", "*.jpg", "*.jpeg", "*.tiff", "*.tif", "*.dng",
-            "*.raw", "*.cr2", "*.nef", "*.arw", "*.bmp"]
+    exts = ["*.png", "*.jpg", "*.jpeg", "*.tiff", "*.tif", "*.bmp"]
     files = []
     for ext in exts:
         files.extend(glob.glob(os.path.join(input_dir, ext)))
@@ -117,94 +98,76 @@ def main():
         print("ERROR: No image files found in", input_dir)
         sys.exit(1)
 
-    print(f"Found {len(files)} files:")
-    for f in files:
-        print(f"  {os.path.basename(f)} ({os.path.getsize(f) / 1024:.0f} KB)")
+    print(f"Found {len(files)} files")
 
-    # Load all images
     print("\nLoading images...")
     images = []
     for f in files:
         try:
             img = load_image(f)
             images.append(img)
-            print(f"  Loaded {os.path.basename(f)}: {img.shape}")
+            print(f"  {os.path.basename(f)}: {img.shape}")
         except Exception as e:
-            print(f"  FAILED to load {os.path.basename(f)}: {e}")
+            print(f"  FAILED {os.path.basename(f)}: {e}")
 
     if len(images) < 2:
-        print("Need at least 2 images to stack!")
+        print("Need at least 2 frames!")
         sys.exit(1)
 
-    # Step 1: Star alignment (needs full star signals, do BEFORE background subtraction)
+    # --- Choose common resolution: most frequent shape -------------------
+    from collections import Counter
+    shape_counts = Counter(im.shape[:2] for im in images)
+    target_hw = shape_counts.most_common(1)[0][0]
+    print(f"\nCommon resolution: {target_hw}")
+
+    print("Normalizing all frames to common resolution...")
+    for i in range(len(images)):
+        if images[i].shape[:2] != target_hw:
+            images[i] = resize_keep_aspect(images[i], target_hw)
+
+    # --- Step 1: Align every frame to the reference ---------------------
+    registered = []
     if HAS_ASTROALIGN:
-        print(f"\nStep 1: Star alignment with astroalign...")
-        try:
-            ref = images[0]
-            ref_shape = ref.shape[:2]
-            registered = [ref]
-
-            for i in range(1, len(images)):
-                try:
-                    # astroalign.register(source, target) returns (aligned_image, footprint)
-                    aligned, footprint = aa.register(images[i], ref)
-                    if aligned.shape[:2] != ref_shape:
-                        from PIL import Image as PILImage
-                        pil = PILImage.fromarray(np.clip(aligned, 0, 255).astype(np.uint8))
-                        pil = pil.resize((ref_shape[1], ref_shape[0]), PILImage.LANCZOS)
-                        aligned = np.array(pil, dtype=np.float64)
-                    registered.append(aligned)
-                    print(f"  Frame {i}: aligned")
-                except Exception as e:
-                    print(f"  Frame {i}: alignment failed ({e}), using unaligned")
-                    registered.append(images[i])
-
-            # Ensure every registered frame matches reference shape
-            print(f"\nNormalizing all frames to reference shape {ref_shape}...")
-            final = []
-            for i, im in enumerate(registered):
-                if im.shape[:2] != ref_shape:
-                    from PIL import Image as PILImage
-                    pil = PILImage.fromarray(np.clip(im, 0, 255).astype(np.uint8))
-                    pil = pil.resize((ref_shape[1], ref_shape[0]), PILImage.LANCZOS)
-                    final.append(np.array(pil, dtype=np.float64))
-                    print(f"  Resized frame {i}: {im.shape[:2]} -> {ref_shape}")
-                else:
-                    final.append(im)
-            registered = final
-        except Exception as e:
-            print(f"\nAstroalign failed: {e}")
-            print("Falling back to simple averaging...")
-            registered = images
+        print("\nStep 1: Star alignment with astroalign...")
+        ref = images[0]
+        registered.append(ref)
+        for i in range(1, len(images)):
+            try:
+                aligned, footprint = aa.register(images[i], ref)
+                if aligned.shape[:2] != target_hw:
+                    aligned = resize_keep_aspect(aligned, target_hw)
+                registered.append(aligned)
+                print(f"  Frame {i}: aligned")
+            except Exception as e:
+                print(f"  Frame {i}: alignment failed ({e}), using unaligned")
+                registered.append(images[i])
     else:
+        print("\nastroalign not available - using unaligned frames")
         registered = images
 
-    # Step 2: Background subtraction on ALIGNED frames (removes video compression fog)
-    print(f"\nStep 2: Background subtraction (removing sky fog)...")
+    # --- Step 2: Background subtraction (remove fog) --------------------
+    print("\nStep 2: Background subtraction...")
     for i, im in enumerate(registered):
         bg = estimate_background(im)
         registered[i] = background_subtract(im)
-        print(f"  Frame {i}: bg_subtracted (bg was {np.round(bg.astype(int)).tolist()})")
+        print(f"  Frame {i}: bg was {np.round(bg.astype(int)).tolist()}")
 
-    # Step 3: Sigma-clip stack
-    print(f"\nStep 3: Sigma-clipping stack ({len(registered)} frames, sigma=2.0)...")
+    # --- Step 3: Sigma-clip stack ---------------------------------------
+    print(f"\nStep 3: Sigma-clip stack ({len(registered)} frames, sigma=2.0)...")
     stacked = sigma_clip_stack(registered, sigma=2.0)
 
-    # Save raw stacked result
-    print("\nSaving results...")
+    # --- Save -------------------------------------------------------------
+    print("\nSaving raw stack...")
     save_image(stacked, os.path.join(output_dir, "stacked_raw.png"))
 
-    # Save histogram-stretched version
+    print("Saving stretched version...")
     stretched = histogram_stretch(stacked)
     save_image(stretched, os.path.join(output_dir, "stacked_stretched.png"))
 
-    # Save enhanced version with contrast boost
+    print("Saving enhanced version...")
     enhanced = histogram_stretch(stacked, low_pct=2.0, high_pct=99.0)
-    # Slight saturation boost
-    hsv = np.zeros_like(enhanced)
     avg = np.mean(enhanced, axis=2, keepdims=True)
-    factor = 1.3
-    enhanced = np.clip(avg + factor * (enhanced - avg), 0, 255)
+    enhanced = np.clip(avg + 1.3 * (enhanced - avg), 0, 255)
     save_image(enhanced, os.path.join(output_dir, "stacked_enhanced.png"))
 
     print(f"\nDone! {len(images)} frames stacked into {output_dir}/")
